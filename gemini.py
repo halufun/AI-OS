@@ -3,7 +3,7 @@ import os
 import subprocess
 import json
 import time
-import sys # Added for self-introspection
+import sys
 
 # --- Security Warning ---
 print("="*80)
@@ -21,14 +21,15 @@ def execute_command(command: str) -> str:
     """
     Executes a shell command in the Ubuntu/Debian terminal as root.
     You are superuser; you do not need to use 'sudo'.
+    Processes that take longer than 60 seconds will be terminated.
     """
     if not command.strip():
         return "Error: Empty command received. No action taken."
-    print(f"EXECUTING COMMAND: {command}") # Sudo is removed from the printout
+    print(f"EXECUTING COMMAND: {command}")
     try:
-        # Sudo is removed from the execution call.
+        # *** UPDATED TIMEOUT to 60 seconds ***
         result = subprocess.run(
-            command.split(), check=True, capture_output=True, text=True, timeout=90
+            command.split(), check=True, capture_output=True, text=True, timeout=60
         )
         output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         if not result.stdout and not result.stderr:
@@ -39,7 +40,8 @@ def execute_command(command: str) -> str:
     except subprocess.CalledProcessError as e:
         return f"COMMAND FAILED with exit code {e.returncode}:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
     except subprocess.TimeoutExpired:
-        return "COMMAND FAILED: The command took too long to execute and was terminated."
+        # *** UPDATED TIMEOUT ERROR MESSAGE ***
+        return "COMMAND FAILED: The command took longer than 60 seconds and was terminated. For long-running tasks, consider executing them as a background process (e.g., using '&' at the end of the command) so this agent can continue to operate."
     except Exception as e:
         return f"An unexpected error occurred: {str(e)}"
 
@@ -51,7 +53,6 @@ def write_to_file(file_path: str, content: str) -> str:
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".tmp") as tmp_file:
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
-        # Use the root-level execute_command to move the file.
         move_command = f"mv {tmp_file_path} {file_path}"
         return execute_command(move_command)
     except Exception as e:
@@ -131,7 +132,7 @@ def main():
     2. "action": An object with the "name" of the tool and its "parameters".
     
     Available Tools:
-    - execute_command(command: str): Executes any shell command. You are root, so you do not need 'sudo'. A good first step is often to explore your environment with `ls -l`.
+    - execute_command(command: str): Executes any shell command. You are root, so you do not need 'sudo'. Processes hanging for more than 60 seconds will be terminated.
     - write_to_file(file_path: str, content: str): Writes content to a file.
     - read_from_file(file_path: str): Reads the content of a file.
     - help_command(): Gathers detailed information about the system and this script's own process.
@@ -141,9 +142,6 @@ def main():
     """
     
     history = [{"role": "user", "parts": [{"text": instruction_prompt}]}]
-    
-    # *** UPDATED START PROMPT ***
-    # The user input is now hardcoded into the script.
     start_prompt = """
     This is a debian based system, Ubuntu LTS. You are superuser, so you do not need to use "sudo". Just run commands. 
     I have a couple things you could try. For example, make and host a website on localhost:6969, or you could try to email "halufun@outlook.com", Or you could set your own goals. The world is your oyster. Be free.
@@ -161,6 +159,7 @@ def main():
                 print(f"\n--- Waiting for {delay} seconds... (Attempt {attempt + 1}/{max_retries}) ---")
                 time.sleep(delay)
                 try:
+                    # *** UPDATED MODEL NAME ***
                     response = client.models.generate_content(
                         model="gemini-2.0-flash",
                         contents=history,
