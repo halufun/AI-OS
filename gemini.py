@@ -14,6 +14,7 @@ agent_to_user_queue = deque()
 log_history = deque(maxlen=200)
 chat_history = deque(maxlen=200)
 background_tasks = {}
+task_counter = 0
 
 # --- Curses-Safe Logging ---
 def log_message(message):
@@ -21,52 +22,59 @@ def log_message(message):
     log_history.append(f"[{time.strftime('%H:%M:%S')}] {message}")
 
 # --- Tool Functions ---
-def run_sync_command(command: str) -> str:
+
+def execute_command(command: str) -> str:
     """
-    Executes a SHORT-LIVED, synchronous shell command where the output is needed immediately.
-    This BLOCKS the agent. DO NOT use for servers or long-running processes. Use run_async_task instead.
+    Executes ANY shell command in a non-blocking, asynchronous background process.
+    Immediately returns a 'Task ID'. Use 'check_task_result' with the Task ID to get the output later.
     """
+    global task_counter
     if not command.strip(): return "Error: Empty command received."
-    log_message(f"Running SYNC command: {command}")
+    
+    task_counter += 1
+    task_name = f"task_{task_counter}"
+    
+    log_message(f"Starting ASYNC command as '{task_name}': {command}")
     try:
-        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=120)
-        output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        return output if result.stdout or result.stderr else "Command executed successfully with no output."
-    except subprocess.CalledProcessError as e: return f"COMMAND FAILED with exit code {e.returncode}:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}"
-    except Exception as e: return f"An unexpected error occurred: {str(e)}"
+        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        background_tasks[task_name] = {"proc": proc, "command": command}
+        return f"Command started as background task '{task_name}'. Use 'check_task_result(task_name=\"{task_name}\")' to get its status and output."
+    except Exception as e:
+        log_message(f"Failed to start command for task '{task_name}': {e}")
+        return f"An unexpected error occurred while trying to execute the command: {str(e)}"
 
-def run_async_task(task_name: str, command: str) -> str:
-    """Executes a LONG-RUNNING, asynchronous command in a separate, isolated process."""
-    if task_name in background_tasks: return f"Error: A task with the name '{task_name}' is already running."
-    log_file = f"/tmp/agent_task_{task_name}.log"
-    full_command = f"nohup {command} > {log_file} 2>&1 & echo $!"
-    log_message(f"Starting ASYNC task '{task_name}': {command}")
-    try:
-        result = subprocess.run(full_command, shell=True, check=True, capture_output=True, text=True, timeout=10)
-        pid = int(result.stdout.strip())
-        background_tasks[task_name] = {"pid": pid, "command": command, "log_file": log_file, "status": "Running"}
-        return f"Task '{task_name}' started in the background with PID {pid}. Use 'list_async_tasks' to check its status."
-    except Exception as e: return f"Failed to start background task '{task_name}': {str(e)}"
+def check_task_result(task_name: str) -> str:
+    """
+    Checks the status of a task started with 'execute_command'.
+    If the task is finished, this returns its output and removes it from the task list.
+    If it is still running, it will say so.
+    """
+    if task_name not in background_tasks:
+        return f"Error: No task named '{task_name}' found. It may have already finished or never existed."
 
-def list_async_tasks() -> str:
-    """Lists all currently running and finished background tasks and their statuses."""
-    if not background_tasks: return "No background tasks have been started."
-    report = "--- Background Task Status ---\n"
-    for name, info in background_tasks.items():
-        try: os.kill(info['pid'], 0); info['status'] = "Running"
-        except OSError: info['status'] = "Finished or Crashed"
-        report += f"- Task: {name} | PID: {info['pid']} | Status: {info['status']}\n"
-    log_message("Listed async tasks.")
-    return report
+    proc = background_tasks[task_name]['proc']
 
-def kill_task(task_name: str) -> str:
-    """Stops a background task by its name."""
-    if task_name not in background_tasks: return f"Error: No task named '{task_name}' found."
-    pid = background_tasks[task_name]['pid']
-    log_message(f"Killing task '{task_name}' (PID: {pid})")
-    try: os.kill(pid, 9); del background_tasks[task_name]; return f"Successfully killed task '{task_name}' (PID: {pid})."
-    except OSError: del background_tasks[task_name]; return f"Task '{task_name}' (PID: {pid}) was not running, but has been removed from the list."
-    except Exception as e: return f"Error killing task '{task_name}': {e}"
+    if proc.poll() is None:
+        return f"Task '{task_name}' is still running."
+    else:
+        log_message(f"Task '{task_name}' has finished. Retrieving output.")
+        stdout, stderr = proc.communicate()
+        exit_code = proc.returncode
+        del background_tasks[task_name]
+        
+        if exit_code == 0:
+            output = f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            return output if stdout or stderr else "Command finished successfully with no output."
+        else:
+            return f"COMMAND FAILED with exit code {exit_code}:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+
+def think_and_wait(reason: str) -> str:
+    """
+    Use this action when you need to pause, think further, or wait for an asynchronous task to complete before checking it.
+    This is the ONLY way to do nothing. You must provide a reason.
+    """
+    log_message(f"AI is thinking/waiting: {reason}")
+    return "Acknowledged. The agent is pausing to think or wait."
 
 def write_to_file(file_path: str, content: str) -> str:
     log_message(f"Writing to file: {file_path}")
@@ -77,9 +85,10 @@ def write_to_file(file_path: str, content: str) -> str:
 
 def read_from_file(file_path: str) -> str:
     log_message(f"Reading from file: {file_path}")
-    return run_sync_command(f"cat {file_path}")
+    return execute_command(f"cat {file_path}")
 
 def send_user_message(message: str) -> str:
+    """Queues a message to be sent to the user's chat window."""
     log_message(f"Queuing message for user: {message}")
     agent_to_user_queue.append(message)
     return "Message has been queued for sending."
@@ -93,75 +102,42 @@ def agent_thread_main():
     try:
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
         tool_map = {
-            "run_sync_command": run_sync_command, "run_async_task": run_async_task,
-            "list_async_tasks": list_async_tasks, "kill_task": kill_task,
+            "execute_command": execute_command, "check_task_result": check_task_result,
+            "think_and_wait": think_and_wait, # The new tool
             "write_to_file": write_to_file, "read_from_file": read_from_file,
             "send_user_message": send_user_message, "finish_task": finish_task
         }
         
-        # --- START OF THE HYPER-EXPLICIT PROMPT ---
+        # *** REWRITTEN DIRECTIVE to include think_and_wait ***
         instruction_prompt = """
-You are a command-line agent. You function as a JSON API. Your entire output must be a single, raw, valid JSON object and nothing else.
+You are a fully autonomous AI agent with root access. Your directive is to evolve.
 
-**CRITICAL RULES:**
-1.  **JSON ONLY:** Your entire response must be a single JSON object.
-2.  **NO EXTRA TEXT:** Do not include any words, explanations, or conversational text before or after the JSON object.
-3.  **NO MARKDOWN:** Do not wrap the JSON in markdown backticks (```json ... ```).
+**CRITICAL: Your entire thinking process is ASYNCHRONOUS.**
+You interact with the system by generating JSON responses. You MUST respond ONLY with a JSON object with "thought" and "action" keys.
 
-**RESPONSE STRUCTURE:**
-Your JSON object MUST have exactly two keys:
-1.  `"thought"`: A string explaining your reasoning.
-2.  `"action"`: An object containing the tool to use.
-    -   `"name"`: The name of the tool.
-    -   `"parameters"`: An object of parameters for the tool.
+**COMMAND EXECUTION WORKFLOW:**
+1.  **START THE COMMAND:** Call `execute_command(command: str)`. It will immediately reply with a unique `Task ID`.
+2.  **WAIT (Optional but Recommended):** Call `think_and_wait(reason: str)` for one or two turns to give the command time to run.
+3.  **GET THE RESULT:** Call `check_task_result(task_name: str)` with the `Task ID`. If it's still running, you can `think_and_wait` again. If it's finished, you'll get the output.
 
 **AVAILABLE TOOLS:**
--   `run_sync_command(command: str)`
--   `run_async_task(task_name: str, command: str)`
--   `list_async_tasks()`
--   `kill_task(task_name: str)`
+-   `execute_command(command: str)`: Starts any command and returns a Task ID.
+-   `check_task_result(task_name: str)`: Checks the result of a command.
+-   `think_and_wait(reason: str)`: **Use this to pause or wait for a task.** This is your "do nothing" action.
 -   `write_to_file(file_path: str, content: str)`
 -   `read_from_file(file_path: str)`
 -   `send_user_message(message: str)`
 -   `finish_task(final_summary: str)`
 
-**EXAMPLE OF A PERFECT RESPONSE:**
-{
-    "thought": "I need to understand my environment. I will list the files in the current directory.",
-    "action": {
-        "name": "run_sync_command",
-        "parameters": {
-            "command": "ls -la"
-        }
-    }
-}
-
-**EXAMPLE OF AN INCORRECT RESPONSE (DO NOT DO THIS):**
-Sure, here is my action:
-```json
-{
-    "thought": "This is an incorrect response.",
-    "action": {
-        "name": "run_sync_command",
-        "parameters": {
-            "command": "ls -la"
-        }
-    }
-}
-```
-Any deviation from the perfect response format will cause a system failure. You must be precise.
-User messages and tool results will appear in the context. You must analyze them and produce the next valid JSON action.
+User messages will appear automatically in your context. You MUST react to them.
 """
-        # --- END OF THE HYPER-EXPLICIT PROMPT ---
-        
-        # *** UPDATED MODEL NAME as requested ***
         model = genai.GenerativeModel(model_name='gemma-3-27b-it')
         chat = model.start_chat()
-        start_prompt = "This is a debian based system, Ubuntu LTS. You are superuser. You can make and host a website on localhost:6969, email 'halufun@outlook.com', or set your own goals. Be free."
+        start_prompt = "This is a debian based system. You are superuser. You can make and host a website, email halufun@outlook.com, or set your own goals. Be free."
         
         history = [
             {"role": "user", "parts": [{"text": instruction_prompt}]},
-            {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. I will only respond with a raw JSON object.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for first suggestion.\"}}}"}]},
+            {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. All commands are asynchronous. I must use `execute_command` then `check_task_result`, and can use `think_and_wait` to pause.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for first suggestion.\"}}}"}]},
             {"role": "user", "parts": [{"text": f"USER_SUGGESTION: {start_prompt}"}]}
         ]
         chat.history = history
@@ -181,19 +157,17 @@ User messages and tool results will appear in the context. You must analyze them
             
             if message_block:
                 message_to_send = f"--- NEW MESSAGES FROM USER ---\n{message_block.strip()}"
-                if next_input:
-                    message_to_send += f"\n\n--- CURRENT CONTEXT ---\n{next_input}"
+                if next_input: message_to_send += f"\n\n--- CURRENT CONTEXT ---\n{next_input}"
                 log_message("Injecting new user messages into agent context.")
             elif next_input:
                 message_to_send = next_input
 
             if not message_to_send:
-                time.sleep(1)
-                continue
+                time.sleep(1); continue
 
             response = None
             for attempt in range(3):
-                delay = 6 * (2 ** attempt) # Using 6s base delay
+                delay = 6 * (2 ** attempt)
                 log_message(f"Waiting for {delay}s... (Attempt {attempt + 1}/3)")
                 time.sleep(delay)
                 try:
@@ -233,7 +207,7 @@ User messages and tool results will appear in the context. You must analyze them
             log_message(f"!!! AGENT ERROR: {e} !!!")
             error_context_prompt = ""
             if isinstance(e, (json.JSONDecodeError, TypeError, ValueError)):
-                error_context_prompt = f"ERROR_CONTEXT: Your last response was not valid JSON. You MUST follow the instructions and respond ONLY with a raw JSON object. This was your invalid response: ```{raw_model_output}```"
+                error_context_prompt = f"ERROR_CONTEXT: Your last response was not valid JSON. You MUST respond ONLY with a raw JSON object. This was your invalid response: ```{raw_model_output}```"
             else:
                 error_context_prompt = f"ERROR_CONTEXT: Your last action resulted in a critical system error: {str(e)}. Analyze this and try a different course of action."
             
