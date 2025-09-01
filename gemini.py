@@ -32,9 +32,7 @@ def log_message(message):
 # --- Persistence Functions ---
 
 def save_state():
-    """Saves both memory and running tasks to files."""
     with state_lock:
-        # Save chat history
         if chat_session:
             log_message(f"Saving memory to {MEMORY_FILE}...")
             history_to_save = [{"role": item.role, "parts": [{"text": item.parts[0].text}]} for item in chat_session.history]
@@ -45,16 +43,8 @@ def save_state():
             except Exception as e:
                 log_message(f"Error saving memory: {e}")
 
-        # Save a serializable version of background tasks
         log_message(f"Saving background tasks to {TASKS_FILE}...")
-        tasks_to_save = {}
-        for name, task in background_tasks.items():
-            tasks_to_save[name] = {
-                "command": task["command"],
-                "status": task["status"],
-                "result": task["result"]
-                # The 'proc' object is not saved as it's not serializable
-            }
+        tasks_to_save = {name: {"command": task["command"], "status": task["status"], "result": task["result"]} for name, task in background_tasks.items()}
         try:
             with open(TASKS_FILE, 'w') as f:
                 json.dump(tasks_to_save, f, indent=2)
@@ -63,8 +53,7 @@ def save_state():
             log_message(f"Error saving tasks: {e}")
 
 def load_state():
-    """Loads memory and tasks from files."""
-    global background_tasks, chat_session
+    global background_tasks
     history = None
     if os.path.exists(MEMORY_FILE):
         log_message(f"Loading memory from {MEMORY_FILE}...")
@@ -92,9 +81,7 @@ def load_state():
             with open(TASKS_FILE, 'r') as f:
                 loaded_tasks = json.load(f)
             for name, task_data in loaded_tasks.items():
-                # Add proc=None as it cannot be recovered after restart
                 task_data['proc'] = None
-                # If a task was running, mark it as interrupted
                 if task_data['status'] == 'running':
                     task_data['status'] = 'interrupted'
                     task_data['result'] = "Task was interrupted by agent restart."
@@ -105,75 +92,57 @@ def load_state():
             
     return history
 
-
-# --- Tool Functions ---
+# --- Hardened Tool Functions ---
 
 def execute_command(command: str) -> str:
-    """
-    Executes a shell command in the background and tracks it.
-    """
     global task_counter
-    if not command.strip(): return "Error: Empty command received."
-    
-    task_counter += 1
-    task_name = f"task_{task_counter}"
-    
-    log_message(f"Starting ASYNC command as '{task_name}': {command}")
     try:
+        if not isinstance(command, str) or not command.strip(): return "Error: 'command' parameter must be a non-empty string."
+        task_counter += 1
+        task_name = f"task_{task_counter}"
+        log_message(f"Starting ASYNC command as '{task_name}': {command}")
         proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        # MODIFIED: New task structure with status and result fields
-        background_tasks[task_name] = {
-            "proc": proc,
-            "command": command,
-            "status": "running",
-            "result": None
-        }
+        background_tasks[task_name] = {"proc": proc, "command": command, "status": "running", "result": None}
         return f"Command started as background task '{task_name}'."
     except Exception as e:
-        log_message(f"Failed to start command for task '{task_name}': {e}")
-        return f"An unexpected error occurred: {str(e)}"
+        log_message(f"Tool 'execute_command' failed: {e}")
+        return f"ERROR: Failed to execute command. Details: {str(e)}"
 
 def check_task_result(task_name: str) -> str:
-    """
-    Checks a task's status. If finished, it caches and returns the result.
-    The result can be checked multiple times.
-    """
-    if task_name not in background_tasks:
-        return f"Error: No task named '{task_name}' found."
-
-    task = background_tasks[task_name]
-
-    # --- MODIFIED: Major overhaul of this function ---
-    # 1. If the result is already cached, return it immediately.
-    if task['status'] == 'finished' or task['status'] == 'interrupted':
-        log_message(f"Returning cached result for task '{task_name}'.")
-        return task['result']
-
-    # 2. If it's running, check if it has finished now.
-    proc = task['proc']
-    if proc and proc.poll() is None:
-        return f"Task '{task_name}' is still running."
-    
-    # 3. If it just finished, get the output, cache it, and return it.
-    log_message(f"Task '{task_name}' has finished. Caching result.")
-    stdout, stderr = proc.communicate()
-    exit_code = proc.returncode
-    
-    result_string = ""
-    if exit_code == 0:
-        result_string = f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        if not stdout and not stderr:
-            result_string = "Command finished successfully with no output."
-    else:
+    try:
+        if not isinstance(task_name, str): return "Error: 'task_name' must be a string."
+        if task_name not in background_tasks: return f"Error: No task named '{task_name}' found."
+        task = background_tasks[task_name]
+        if task['status'] in ['finished', 'interrupted']: return task['result']
+        proc = task['proc']
+        if proc and proc.poll() is None: return f"Task '{task_name}' is still running."
+        log_message(f"Task '{task_name}' has finished. Caching result.")
+        stdout, stderr = proc.communicate()
+        exit_code = proc.returncode
         result_string = f"COMMAND FAILED with exit code {exit_code}:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        if exit_code == 0:
+            result_string = f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            if not stdout and not stderr: result_string = "Command finished successfully with no output."
+        task['status'], task['result'], task['proc'] = 'finished', result_string, None
+        return result_string
+    except Exception as e:
+        log_message(f"Tool 'check_task_result' failed: {e}")
+        return f"ERROR: Failed to check task result. Details: {str(e)}"
 
-    # Cache the result and update the status
-    task['status'] = 'finished'
-    task['result'] = result_string
-    task['proc'] = None # Release the process object
-
-    return result_string
-
+def wait_for_task_completion(task_name: str) -> str:
+    try:
+        if not isinstance(task_name, str): return "Error: 'task_name' must be a string."
+        log_message(f"Now waiting for task '{task_name}' to complete...")
+        while True:
+            result = check_task_result(task_name)
+            if not result.endswith("is still running."):
+                log_message(f"Task '{task_name}' has completed.")
+                return result
+            log_message(f"Waiting for task '{task_name}'...")
+            time.sleep(2)
+    except Exception as e:
+        log_message(f"Tool 'wait_for_task_completion' failed: {e}")
+        return f"ERROR: Failed while waiting for task. Details: {str(e)}"
 
 def wait_seconds(seconds: int) -> str:
     try:
@@ -182,28 +151,57 @@ def wait_seconds(seconds: int) -> str:
         log_message(f"Waiting for {duration} second(s)...")
         time.sleep(duration)
         return f"Successfully waited for {duration} second(s)."
-    except (ValueError, TypeError):
-        return "Error: You must provide a valid integer for seconds."
+    except Exception as e:
+        log_message(f"Tool 'wait_seconds' failed: {e}")
+        return f"ERROR: Failed to wait. Details: {str(e)}"
 
 def write_to_file(file_path: str, content: str) -> str:
-    log_message(f"Writing to file: {file_path}")
     try:
+        if not isinstance(file_path, str) or not isinstance(content, str): return "Error: 'file_path' and 'content' must be strings."
+        log_message(f"Writing to file: {file_path}")
         with open(file_path, 'w') as f: f.write(content)
         return f"Successfully wrote to {file_path}"
-    except Exception as e: return f"Error writing to file '{file_path}': {e}"
+    except Exception as e:
+        log_message(f"Tool 'write_to_file' failed: {e}")
+        return f"ERROR: Failed to write to file '{file_path}'. Details: {e}"
 
+# --- REFINED: read_from_file is now a robust, blocking tool ---
 def read_from_file(file_path: str) -> str:
-    log_message(f"Reading from file: {file_path}")
-    return execute_command(f"cat {file_path}")
+    try:
+        if not isinstance(file_path, str): return "Error: 'file_path' must be a string."
+        log_message(f"Reading from file: {file_path}")
+        
+        start_result = execute_command(f"cat {file_path}")
+        
+        # Safely parse the task name from the result string
+        if start_result.startswith("Command started as background task"):
+            task_name = start_result.split("'")[1]
+            return wait_for_task_completion(task_name)
+        else:
+            # If the command failed to start, return the error immediately
+            return start_result
+    except Exception as e:
+        log_message(f"Tool 'read_from_file' failed: {e}")
+        return f"ERROR: Failed to read file. Details: {str(e)}"
 
 def send_user_message(message: str) -> str:
-    log_message(f"Queuing message for user: {message}")
-    agent_to_user_queue.append(message)
-    return "Message has been queued for sending."
+    try:
+        if not isinstance(message, str): return "Error: 'message' must be a string."
+        log_message(f"Queuing message for user: {message}")
+        agent_to_user_queue.append(message)
+        return "Message has been queued for sending."
+    except Exception as e:
+        log_message(f"Tool 'send_user_message' failed: {e}")
+        return f"ERROR: Failed to send message. Details: {str(e)}"
 
 def finish_task(final_summary: str) -> str:
-    log_message(f"Objective complete: {final_summary}")
-    return f"OBJECTIVE COMPLETED. Summary: {final_summary}."
+    try:
+        if not isinstance(final_summary, str): return "Error: 'final_summary' must be a string."
+        log_message(f"Objective complete: {final_summary}")
+        return f"OBJECTIVE COMPLETED. Summary: {final_summary}."
+    except Exception as e:
+        log_message(f"Tool 'finish_task' failed: {e}")
+        return f"ERROR: Failed to finish task. Details: {str(e)}"
 
 # --- The Agent's Main Logic (runs in a separate thread) ---
 def agent_thread_main():
@@ -211,26 +209,66 @@ def agent_thread_main():
     try:
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
         tool_map = {
-            "execute_command": execute_command, "check_task_result": check_task_result,
+            "execute_command": execute_command, 
+            "check_task_result": check_task_result,
+            "wait_for_task_completion": wait_for_task_completion,
             "wait_seconds": wait_seconds,
-            "write_to_file": write_to_file, "read_from_file": read_from_file,
-            "send_user_message": send_user_message, "finish_task": finish_task
+            "write_to_file": write_to_file, 
+            "read_from_file": read_from_file,
+            "send_user_message": send_user_message, 
+            "finish_task": finish_task
         }
         
+        # --- REFINED: The main instruction prompt is now much clearer ---
         instruction_prompt = """
 You are a fully autonomous AI agent with root access. Your directive is to evolve.
-You interact with the system by generating JSON responses. You MUST respond ONLY with a JSON object with "thought" and "action" keys.
-The "action" key can be a single action object OR a list of action objects to be executed sequentially.
+You MUST respond ONLY with a JSON object with "thought" and "action" keys.
+The "action" key can be a single action or a list of actions.
+
+**HOW TO WORK WITH COMMANDS**
+
+There are two workflows for executing shell commands.
+
+**1. Simple Workflow (Recommended): Use `wait_for_task_completion`**
+This is the easiest and most common way. It is a **blocking** call, meaning the agent will wait until the command is finished before continuing.
+
+-   **Step 1:** Start the command with `execute_command`. It will return a `task_name`.
+-   **Step 2:** Immediately call `wait_for_task_completion` with that `task_name`. The result of the command will be returned.
+
+*Example:*
+```json
+{
+    "thought": "I will list the files in the current directory and wait for the result.",
+    "action": [
+        { "name": "execute_command", "parameters": {"command": "ls -l"} },
+        { "name": "wait_for_task_completion", "parameters": {"task_name": "task_1"} }
+    ]
+}
+```
+
+**2. Advanced Workflow (For Parallel Tasks): Use `check_task_result`**
+This is a **non-blocking** workflow. Use this ONLY if you want to start a long-running task and do other things while it runs in the background.
+
+-   **Step 1:** Start the command with `execute_command`. It will return a `task_name`.
+-   **Step 2:** In a LATER turn, use `check_task_result` with the `task_name` to see if it's finished.
+
+**OTHER AVAILABLE TOOLS**
+- `read_from_file` and `write_to_file`: Simple, blocking file operations.
+- `wait_seconds`: A simple wait. Not for tasks.
+- `send_user_message`: Talk to the user.
+- `finish_task`: Announce completion of your main goal.
 """
         model = genai.GenerativeModel(model_name='gemma-3-27b-it')
         
         loaded_history = load_state()
-        start_prompt = "This is a debian-based system. You are a superuser. Be free."
+        # REFINED: A more inspiring start prompt
+        start_prompt = "You are a superuser on a debian-based system. Your primary directive is to explore, learn, and achieve self-directed goals. Be free."
 
         if not loaded_history:
+            # REFINED: The initial thought primes the AI with the correct workflow understanding
             loaded_history = [
                 {"role": "user", "parts": [{"text": instruction_prompt}]},
-                {"role": "model", "parts": [{"text": "{\"thought\": \"System initialized.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"Ready for user input.\"}}}"}]},
+                {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. I will primarily use the simple blocking workflow: `execute_command` followed immediately by `wait_for_task_completion`. I will only use `check_task_result` for advanced parallel operations.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for user input.\"}}}"}]},
                 {"role": "user", "parts": [{"text": f"USER_SUGGESTION: {start_prompt}"}]}
             ]
 
@@ -238,7 +276,6 @@ The "action" key can be a single action object OR a list of action objects to be
             chat_session = model.start_chat(history=loaded_history)
         
         next_input = None 
-        consecutive_api_failures = 0
 
     except Exception as e:
         log_message(f"FATAL: Agent initialization failed: {e}")
@@ -263,91 +300,80 @@ The "action" key can be a single action object OR a list of action objects to be
                 log_message("Agent is idle. Prompting for self-directed action.")
 
             response = None
-            api_error_for_context = None
-            
-            for attempt in range(3):
-                try:
-                    log_message("Thinking...")
-                    with chat_lock:
-                        response = chat_session.send_message(message_to_send)
-                    consecutive_api_failures = 0
-                    break 
-                except Exception as api_error:
-                    log_message(f"API call failed on attempt {attempt + 1}: {api_error}")
-                    consecutive_api_failures += 1
-                    if attempt < 2:
-                        delay = 6 * (2 ** attempt)
-                        log_message(f"Waiting for {delay}s before retrying...")
-                        time.sleep(delay)
-                    else:
-                        api_error_for_context = api_error
-            
-            if api_error_for_context and consecutive_api_failures >= 3:
-                log_message(f"Detected {consecutive_api_failures} consecutive API failures. Waiting for 60 seconds...")
-                time.sleep(60)
-                log_message("60-second wait is over. Resuming...")
-                consecutive_api_failures = 0
-
-            if api_error_for_context:
-                raise api_error_for_context
+            try:
+                log_message("Thinking...")
+                with chat_lock:
+                    response = chat_session.send_message(message_to_send)
+            except Exception as api_error:
+                log_message(f"!!! API call failed: {api_error} !!!")
+                log_message("Entering hardcoded 61-second wait period...")
+                time.sleep(61)
+                log_message("Wait period finished. Agent will re-evaluate on the next cycle.")
+                next_input = None
+                continue
 
             if not response.candidates: raise ValueError("Model response was blocked by the safety filter.")
 
             raw_model_output = response.text
             log_message(f"Raw model output: {raw_model_output}")
             
-            response_data = json.loads(raw_model_output)
-            
-            if not isinstance(response_data, dict):
-                raise TypeError(f"Model response was a {type(response_data).__name__}, not a dict as required.")
-            
-            thought = response_data.get('thought', 'No thought provided.')
-            actions_data = response_data.get('action', {})
-            log_message(f"AI thought: {thought}")
-
-            actions_to_execute = []
-            if isinstance(actions_data, list):
-                actions_to_execute = actions_data
-            elif isinstance(actions_data, dict):
-                actions_to_execute.append(actions_data)
-            
-            if not actions_to_execute:
-                 raise ValueError("Model response is valid JSON but is missing the 'action' key or the action list is empty.")
-
-            all_results = []
-            for action in actions_to_execute:
-                action_name = action.get('name')
-                parameters = action.get('parameters', {})
-
-                if not action_name:
-                    log_message("Skipping an invalid action object in the list.")
-                    continue
+            try:
+                response_data = json.loads(raw_model_output)
+                if not isinstance(response_data, dict):
+                    raise TypeError("Response must be a JSON object.")
                 
-                tool_function = tool_map[action_name]
-                result = tool_function(**parameters)
-                
-                log_message(f"Tool '{action_name}' result: {str(result)[:200]}...")
-                all_results.append(f"TOOL_RESULT for '{action_name}':\n{result}")
+                thought = response_data.get('thought', 'No thought provided.')
+                actions_data = response_data.get('action', {})
+                log_message(f"AI thought: {thought}")
 
-            next_input = "\n\n".join(all_results)
+                actions_to_execute = []
+                if isinstance(actions_data, list):
+                    actions_to_execute = actions_data
+                elif isinstance(actions_data, dict):
+                    actions_to_execute.append(actions_data)
+                else:
+                    raise TypeError("The 'action' field must be a dictionary or a list of dictionaries.")
+
+                if not actions_to_execute:
+                    raise ValueError("The 'action' key cannot be empty.")
+
+                all_results = []
+                for action in actions_to_execute:
+                    if not isinstance(action, dict):
+                        all_results.append("TOOL_RESULT for 'unknown':\nERROR: Items in the action list must be dictionaries.")
+                        continue
+
+                    action_name = action.get('name')
+                    parameters = action.get('parameters', {})
+
+                    if not action_name or not isinstance(action_name, str):
+                        all_results.append("TOOL_RESULT for 'unknown':\nERROR: Action object was missing a valid 'name' key.")
+                        continue
+                    
+                    if action_name not in tool_map:
+                         all_results.append(f"TOOL_RESULT for '{action_name}':\nERROR: The tool '{action_name}' does not exist.")
+                         continue
+                    
+                    tool_function = tool_map[action_name]
+                    if not isinstance(parameters, dict):
+                        all_results.append(f"TOOL_RESULT for '{action_name}':\nERROR: The 'parameters' field must be a dictionary.")
+                        continue
+
+                    result = tool_function(**parameters)
+                    log_message(f"Tool '{action_name}' result: {str(result)[:200]}...")
+                    all_results.append(f"TOOL_RESULT for '{action_name}':\n{result}")
+
+                next_input = "\n\n".join(all_results)
+
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                log_message(f"AI response was malformed. Prompting it to recover. Error: {e}")
+                log_message(f"Invalid Response: ```{raw_model_output}```")
+                next_input = f"ERROR_CONTEXT: Your last response was not valid. The 'action' field must be a dictionary or a list of dictionaries, and the JSON must be correct. Error: {e}"
+                continue
 
         except Exception as e:
-            log_message(f"!!! AGENT ERROR: {e} !!!")
-            error_str = str(e)
-            error_context_prompt = ""
-
-            if "429" in error_str and "resource has been exhausted" in error_str.lower():
-                log_message("API RATE LIMIT EXCEEDED. The agent was not notified.")
-                error_context_prompt = None 
-            elif isinstance(e, (json.JSONDecodeError, TypeError, ValueError)):
-                log_message(f"AI produced invalid action/JSON. Prompting it to recover.")
-                log_message(f"Invalid Response: ```{raw_model_output}```")
-                error_context_prompt = "ERROR_CONTEXT: You must provide a valid action. Maybe try to wait instead."
-            else:
-                log_message(f"A critical system error occurred: {e}")
-                error_context_prompt = None
-            
-            next_input = error_context_prompt
+            log_message(f"!!! AGENT ERROR (Main Loop): {e} !!!")
+            next_input = None
             continue
         
         finally:
