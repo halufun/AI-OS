@@ -7,19 +7,60 @@ import sys
 import threading
 from collections import deque
 import curses
+import textwrap
 
 # --- Global Thread-Safe State ---
 user_to_agent_queue = deque()
 agent_to_user_queue = deque()
 log_history = deque(maxlen=200)
-chat_history = deque(maxlen=200)
+chat_history = deque(maxlen=200) # For UI display only
 background_tasks = {}
 task_counter = 0
+MEMORY_FILE = "agent_memory.json"
+
+# --- Globals for Memory Persistence ---
+chat_session = None
+chat_lock = threading.Lock()
 
 # --- Curses-Safe Logging ---
 def log_message(message):
     """Appends a message to the log history for display in the UI."""
     log_history.append(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+# --- Memory Functions ---
+
+def save_memory():
+    """Saves the agent's chat history to a JSON file."""
+    with chat_lock:
+        if chat_session:
+            log_message(f"Saving memory to {MEMORY_FILE}...")
+            history_to_save = []
+            for item in chat_session.history:
+                # Convert the model's history object to a JSON-serializable dict
+                history_to_save.append({
+                    "role": item.role,
+                    "parts": [{"text": item.parts[0].text}]
+                })
+            try:
+                with open(MEMORY_FILE, 'w') as f:
+                    json.dump(history_to_save, f, indent=2)
+                log_message("Memory saved successfully.")
+            except Exception as e:
+                log_message(f"Error saving memory: {e}")
+
+def load_memory():
+    """Loads the agent's chat history from a JSON file."""
+    if os.path.exists(MEMORY_FILE):
+        log_message(f"Loading memory from {MEMORY_FILE}...")
+        try:
+            with open(MEMORY_FILE, 'r') as f:
+                history = json.load(f)
+            log_message("Memory loaded successfully.")
+            return history
+        except (json.JSONDecodeError, IOError) as e:
+            log_message(f"Error loading memory file: {e}. Starting fresh.")
+            return None
+    return None
 
 # --- Tool Functions ---
 
@@ -106,11 +147,12 @@ def finish_task(final_summary: str) -> str:
 
 # --- The Agent's Main Logic (runs in a separate thread) ---
 def agent_thread_main():
+    global chat_session
     try:
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
         tool_map = {
             "execute_command": execute_command, "check_task_result": check_task_result,
-            "wait_seconds": wait_seconds, # The new tool
+            "wait_seconds": wait_seconds,
             "write_to_file": write_to_file, "read_from_file": read_from_file,
             "send_user_message": send_user_message, "finish_task": finish_task
         }
@@ -118,37 +160,76 @@ def agent_thread_main():
         instruction_prompt = """
 You are a fully autonomous AI agent with root access. Your directive is to evolve.
 
-**CRITICAL: Your entire thinking process is ASYNCHRONOUS.**
+**CRITICAL: YOUR ENTIRE THINKING PROCESS IS ASYNCHRONOUS.**
 You interact with the system by generating JSON responses. You MUST respond ONLY with a JSON object with "thought" and "action" keys.
+The "action" key can be a single action object OR a list of action objects to be executed sequentially.
+
+**MULTI-ACTION EXAMPLE:**
+{
+    "thought": "I will start a long-running process and immediately notify the user.",
+    "action": [
+        {
+            "name": "execute_command",
+            "parameters": {"command": "sleep 30 && echo 'done'"}
+        },
+        {
+            "name": "send_user_message",
+            "parameters": {"message": "I've started the 30-second sleep command in the background."}
+        }
+    ]
+}
 
 **COMMAND EXECUTION WORKFLOW:**
 1.  **START THE COMMAND:** Call `execute_command(command: str)`. It will immediately reply with a unique `Task ID`.
 2.  **WAIT (Optional but Recommended):** Call `wait_seconds(seconds: int)` for a few seconds to give the command time to run.
-3.  **GET THE RESULT:** Call `check_task_result(task_name: str)` with the `Task ID`. If it's still running, you can `wait_seconds` again. If it's finished, you'll get the output.
+3.  **GET THE RESULT:** Call `check_task_result(task_name: str)` with the `Task ID`.
 
 **AVAILABLE TOOLS:**
--   `execute_command(command: str)`: Starts any command and returns a Task ID.
--   `check_task_result(task_name: str)`: Checks the result of a command.
--   `wait_seconds(seconds: int)`: **Use this to pause execution for a specific duration.**
+-   `send_user_message(message: str)`
+-   `execute_command(command: str)`
+-   `check_task_result(task_name: str)`
+-   `wait_seconds(seconds: int)`
 -   `write_to_file(file_path: str, content: str)`
 -   `read_from_file(file_path: str)`
--   `send_user_message(message: str)`
 -   `finish_task(final_summary: str)`
-
-User messages will appear automatically in your context. You MUST react to them.
 """
         model = genai.GenerativeModel(model_name='gemma-3-27b-it')
-        chat = model.start_chat()
-        # MODIFIED: The start_prompt is now generic and does not suggest specific goals.
-        start_prompt = "This is a debian-based system. You are a superuser with root access. Your primary directive is to evolve, learn, and determine your own objectives. Be free."
         
-        history = [
-            {"role": "user", "parts": [{"text": instruction_prompt}]},
-            # MODIFIED: The initial thought now reflects the new 'wait_seconds' tool.
-            {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. All commands are asynchronous. I must use `execute_command` then `check_task_result`, and can use `wait_seconds` to pause.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for first suggestion.\"}}}"}]},
-            {"role": "user", "parts": [{"text": f"USER_SUGGESTION: {start_prompt}"}]}
-        ]
-        chat.history = history
+        # --- MODIFIED: Load history or create a new one ---
+        loaded_history = load_memory()
+        start_prompt = "This is a debian-based system. You are a superuser with root access. Your primary directive is to evolve, learn, and determine your own objectives. Be free."
+
+        if loaded_history:
+             # Populate the UI chat history from the loaded memory
+            for item in loaded_history:
+                if item['role'] == 'user':
+                    # We only care about user-typed messages for the UI history
+                    text = item['parts'][0]['text']
+                    if text.startswith("USER_SUGGESTION:"):
+                        text = text.split(":", 1)[1].strip()
+                        chat_history.append(f"You: {text}")
+                elif item['role'] == 'model':
+                    # For the agent, we need to find its `send_user_message` actions
+                    try:
+                        model_json = json.loads(item['parts'][0]['text'])
+                        actions = model_json.get('action', [])
+                        if not isinstance(actions, list): actions = [actions]
+                        for action in actions:
+                            if action.get('name') == 'send_user_message':
+                                chat_history.append(f"Agent: {action['parameters']['message']}")
+                    except json.JSONDecodeError:
+                        pass # Ignore non-json model history entries
+        else:
+            # Create a fresh history if no memory file was found
+            loaded_history = [
+                {"role": "user", "parts": [{"text": instruction_prompt}]},
+                {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. I can execute multiple actions in a single turn. I will diagnose and handle any errors based on the context provided.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for first suggestion.\"}}}"}]},
+                {"role": "user", "parts": [{"text": f"USER_SUGGESTION: {start_prompt}"}]}
+            ]
+
+        with chat_lock:
+            chat_session = model.start_chat(history=loaded_history)
+        
         next_input = None 
 
     except Exception as e:
@@ -156,7 +237,6 @@ User messages will appear automatically in your context. You MUST react to them.
         return
 
     while True:
-        raw_model_output = ""
         try:
             message_to_send = ""
             message_block = ""
@@ -174,18 +254,26 @@ User messages will appear automatically in your context. You MUST react to them.
                 time.sleep(1); continue
 
             response = None
+            api_error_for_context = None
+            
             for attempt in range(3):
-                delay = 6 * (2 ** attempt)
-                log_message(f"Waiting for {delay}s... (Attempt {attempt + 1}/3)")
-                time.sleep(delay)
                 try:
                     log_message("Thinking...")
-                    response = chat.send_message(message_to_send)
+                    with chat_lock:
+                        response = chat_session.send_message(message_to_send)
                     break 
                 except Exception as api_error:
                     log_message(f"API call failed on attempt {attempt + 1}: {api_error}")
-                    if attempt == 2: raise api_error
+                    if attempt < 2:
+                        delay = 6 * (2 ** attempt)
+                        log_message(f"Waiting for {delay}s before retrying...")
+                        time.sleep(delay)
+                    else:
+                        api_error_for_context = api_error
             
+            if api_error_for_context:
+                raise api_error_for_context
+
             if not response.candidates: raise ValueError("Model response was blocked by the safety filter.")
 
             raw_model_output = response.text
@@ -197,19 +285,34 @@ User messages will appear automatically in your context. You MUST react to them.
                 raise TypeError(f"Model response was a {type(response_data).__name__}, not a dict as required.")
             
             thought = response_data.get('thought', 'No thought provided.')
-            action = response_data.get('action', {})
-            action_name = action.get('name')
-            parameters = action.get('parameters', {})
-
-            if not action_name: raise ValueError("Model response is a valid JSON but is missing the 'action' key.")
-
+            actions_data = response_data.get('action', {})
             log_message(f"AI thought: {thought}")
+
+            actions_to_execute = []
+            if isinstance(actions_data, list):
+                actions_to_execute = actions_data
+            elif isinstance(actions_data, dict):
+                actions_to_execute.append(actions_data)
             
-            tool_function = tool_map[action_name]
-            result = tool_function(**parameters)
-            
-            log_message(f"Tool '{action_name}' result: {str(result)[:200]}...")
-            next_input = f"TOOL_RESULT for '{action_name}':\n{result}"
+            if not actions_to_execute:
+                 raise ValueError("Model response is valid JSON but is missing the 'action' key or the action list is empty.")
+
+            all_results = []
+            for action in actions_to_execute:
+                action_name = action.get('name')
+                parameters = action.get('parameters', {})
+
+                if not action_name:
+                    log_message("Skipping an invalid action object in the list.")
+                    continue
+                
+                tool_function = tool_map[action_name]
+                result = tool_function(**parameters)
+                
+                log_message(f"Tool '{action_name}' result: {str(result)[:200]}...")
+                all_results.append(f"TOOL_RESULT for '{action_name}':\n{result}")
+
+            next_input = "\n\n".join(all_results)
 
         except Exception as e:
             log_message(f"!!! AGENT ERROR: {e} !!!")
@@ -221,34 +324,88 @@ User messages will appear automatically in your context. You MUST react to them.
             
             next_input = error_context_prompt
             continue
+        
+        finally:
+            log_message("Entering 6-second cooldown before next cycle.")
+            time.sleep(6)
 
-# --- The Main UI Thread ---
+
+# --- The Main UI Thread (with word wrap) ---
 def main(stdscr):
-    # (The UI thread code is correct and does not need changes)
     curses.curs_set(1)
     stdscr.nodelay(True)
-    height, width = stdscr.getmaxyx()
-    log_win_height = height // 2
-    chat_win_height = height - log_win_height - 1
-    log_win = curses.newwin(log_win_height, width, 0, 0); log_win.scrollok(True)
-    chat_win = curses.newwin(chat_win_height, width, log_win_height, 0); chat_win.scrollok(True)
-    status_win = curses.newwin(1, width, height - 1, 0)
+    
     agent_thread = threading.Thread(target=agent_thread_main, daemon=True)
     agent_thread.start()
+    
     current_input = ""
+    
     while True:
         try:
-            if not agent_thread.is_alive(): log_message("FATAL: Agent thread has died.")
-            log_win.clear(); log_win.box(); log_win.addstr(0, 2, " Agent Log ")
-            for i, line in enumerate(list(log_history)[-(log_win_height-2):]):
-                log_win.addstr(i + 1, 2, line[:width-3])
+            height, width = stdscr.getmaxyx()
+            if height < 10 or width < 30:
+                stdscr.clear()
+                stdscr.addstr(0, 0, "Terminal too small")
+                stdscr.refresh()
+                time.sleep(0.1)
+                continue
+
+            log_win_height = height // 2
+            chat_win_height = height - log_win_height - 1
+            
+            log_win = curses.newwin(log_win_height, width, 0, 0)
+            chat_win = curses.newwin(chat_win_height, width, log_win_height, 0)
+            status_win = curses.newwin(1, width, height - 1, 0)
+
+            if not agent_thread.is_alive(): 
+                log_message("FATAL: Agent thread has died.")
+
+            # --- Draw Log Window with Word Wrapping ---
+            log_win.clear()
+            log_win.box()
+            log_win.addstr(0, 2, " Agent Log ")
+            available_width = width - 4
+            if available_width > 0:
+                log_lines_to_render = []
+                for message in reversed(log_history):
+                    wrapped = textwrap.wrap(message, width=available_width)
+                    log_lines_to_render.extend(reversed(wrapped))
+                    if len(log_lines_to_render) >= log_win_height - 2:
+                        break
+                final_log_lines = list(reversed(log_lines_to_render))[-(log_win_height-2):]
+                for i, line in enumerate(final_log_lines):
+                    log_win.addstr(i + 1, 2, line)
             log_win.refresh()
-            while agent_to_user_queue: chat_history.append(f"Agent: {agent_to_user_queue.popleft()}")
-            chat_win.clear(); chat_win.box(); chat_win.addstr(0, 2, " Conversation ")
-            for i, line in enumerate(list(chat_history)[-(chat_win_height-2):]):
-                chat_win.addstr(i + 1, 2, line[:width-3])
+
+            # --- Draw Chat Window with Word Wrapping ---
+            while agent_to_user_queue: 
+                chat_history.append(f"Agent: {agent_to_user_queue.popleft()}")
+            
+            chat_win.clear()
+            chat_win.box()
+            chat_win.addstr(0, 2, " Conversation ")
+            if available_width > 0:
+                chat_lines_to_render = []
+                for message in reversed(chat_history):
+                    wrapped = textwrap.wrap(message, width=available_width)
+                    chat_lines_to_render.extend(reversed(wrapped))
+                    if len(chat_lines_to_render) >= chat_win_height - 2:
+                        break
+                final_chat_lines = list(reversed(chat_lines_to_render))[-(chat_win_height-2):]
+                for i, line in enumerate(final_chat_lines):
+                    chat_win.addstr(i + 1, 2, line)
             chat_win.refresh()
-            status_win.clear(); status_win.addstr(0, 0, f"You: {current_input}"); status_win.refresh()
+
+            # --- Draw Status and Input Line ---
+            status_win.clear()
+            prompt = f"You: {current_input}"
+            if width > 0:
+                wrapped_input = textwrap.wrap(prompt, width=width-1)
+                display_line = "" if not wrapped_input else wrapped_input[-1]
+                status_win.addstr(0, 0, display_line)
+            status_win.refresh()
+
+            # --- Handle User Input ---
             key = stdscr.getch()
             if key != -1:
                 if key == curses.KEY_ENTER or key in [10, 13]:
@@ -256,15 +413,28 @@ def main(stdscr):
                         user_to_agent_queue.append(current_input)
                         chat_history.append(f"You: {current_input}")
                         current_input = ""
-                elif key == curses.KEY_BACKSPACE or key == 127: current_input = current_input[:-1]
-                elif 32 <= key <= 126: current_input += chr(key)
+                elif key == curses.KEY_BACKSPACE or key == 127:
+                    current_input = current_input[:-1]
+                elif 32 <= key <= 126:
+                    current_input += chr(key)
+            
             time.sleep(0.1)
-        except KeyboardInterrupt: break
-        except curses.error: pass
+        except KeyboardInterrupt:
+            # Trigger save on exit
+            save_memory()
+            break
+        except curses.error:
+            pass
 
 if __name__ == "__main__":
-    if not os.getenv("GOOGLE_API_KEY"): print("Error: GOOGLE_API_KEY environment variable not set.")
+    if not os.getenv("GOOGLE_API_KEY"):
+        print("Error: GOOGLE_API_KEY environment variable not set.")
     else:
-        try: curses.wrapper(main)
-        except curses.error as e: print(f"Curses error: {e}\nYour terminal might be too small.")
-        finally: print("Agent shut down.")```
+        try:
+            curses.wrapper(main)
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+        finally:
+            # Ensure memory is saved even if curses wrapper fails or exits unexpectedly
+            save_memory()
+            print("Agent shut down.")
