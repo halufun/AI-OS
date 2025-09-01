@@ -68,13 +68,20 @@ def check_task_result(task_name: str) -> str:
         else:
             return f"COMMAND FAILED with exit code {exit_code}:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
 
-def think_and_wait(reason: str) -> str:
+def wait_seconds(seconds: int) -> str:
     """
-    Use this action when you need to pause, think further, or wait for an asynchronous task to complete before checking it.
-    This is the ONLY way to do nothing. You must provide a reason.
+    Pauses the agent's execution for a specified number of seconds.
+    This is a blocking call that will halt the agent's thinking process for the duration.
     """
-    log_message(f"AI is thinking/waiting: {reason}")
-    return "Acknowledged. The agent is pausing to think or wait."
+    try:
+        duration = int(seconds)
+        if duration < 0:
+            return "Error: Cannot wait for a negative duration."
+        log_message(f"Waiting for {duration} second(s)...")
+        time.sleep(duration)
+        return f"Successfully waited for {duration} second(s)."
+    except (ValueError, TypeError):
+        return "Error: You must provide a valid integer for the number of seconds to wait."
 
 def write_to_file(file_path: str, content: str) -> str:
     log_message(f"Writing to file: {file_path}")
@@ -103,12 +110,11 @@ def agent_thread_main():
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
         tool_map = {
             "execute_command": execute_command, "check_task_result": check_task_result,
-            "think_and_wait": think_and_wait, # The new tool
+            "wait_seconds": wait_seconds, # The new tool
             "write_to_file": write_to_file, "read_from_file": read_from_file,
             "send_user_message": send_user_message, "finish_task": finish_task
         }
         
-        # *** REWRITTEN DIRECTIVE to include think_and_wait ***
         instruction_prompt = """
 You are a fully autonomous AI agent with root access. Your directive is to evolve.
 
@@ -117,13 +123,13 @@ You interact with the system by generating JSON responses. You MUST respond ONLY
 
 **COMMAND EXECUTION WORKFLOW:**
 1.  **START THE COMMAND:** Call `execute_command(command: str)`. It will immediately reply with a unique `Task ID`.
-2.  **WAIT (Optional but Recommended):** Call `think_and_wait(reason: str)` for one or two turns to give the command time to run.
-3.  **GET THE RESULT:** Call `check_task_result(task_name: str)` with the `Task ID`. If it's still running, you can `think_and_wait` again. If it's finished, you'll get the output.
+2.  **WAIT (Optional but Recommended):** Call `wait_seconds(seconds: int)` for a few seconds to give the command time to run.
+3.  **GET THE RESULT:** Call `check_task_result(task_name: str)` with the `Task ID`. If it's still running, you can `wait_seconds` again. If it's finished, you'll get the output.
 
 **AVAILABLE TOOLS:**
 -   `execute_command(command: str)`: Starts any command and returns a Task ID.
 -   `check_task_result(task_name: str)`: Checks the result of a command.
--   `think_and_wait(reason: str)`: **Use this to pause or wait for a task.** This is your "do nothing" action.
+-   `wait_seconds(seconds: int)`: **Use this to pause execution for a specific duration.**
 -   `write_to_file(file_path: str, content: str)`
 -   `read_from_file(file_path: str)`
 -   `send_user_message(message: str)`
@@ -133,11 +139,13 @@ User messages will appear automatically in your context. You MUST react to them.
 """
         model = genai.GenerativeModel(model_name='gemma-3-27b-it')
         chat = model.start_chat()
-        start_prompt = "This is a debian based system. You are superuser. You can make and host a website, email halufun@outlook.com, or set your own goals. Be free."
+        # MODIFIED: The start_prompt is now generic and does not suggest specific goals.
+        start_prompt = "This is a debian-based system. You are a superuser with root access. Your primary directive is to evolve, learn, and determine your own objectives. Be free."
         
         history = [
             {"role": "user", "parts": [{"text": instruction_prompt}]},
-            {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. All commands are asynchronous. I must use `execute_command` then `check_task_result`, and can use `think_and_wait` to pause.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for first suggestion.\"}}}"}]},
+            # MODIFIED: The initial thought now reflects the new 'wait_seconds' tool.
+            {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. All commands are asynchronous. I must use `execute_command` then `check_task_result`, and can use `wait_seconds` to pause.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for first suggestion.\"}}}"}]},
             {"role": "user", "parts": [{"text": f"USER_SUGGESTION: {start_prompt}"}]}
         ]
         chat.history = history
@@ -259,4 +267,4 @@ if __name__ == "__main__":
     else:
         try: curses.wrapper(main)
         except curses.error as e: print(f"Curses error: {e}\nYour terminal might be too small.")
-        finally: print("Agent shut down.")
+        finally: print("Agent shut down.")```
