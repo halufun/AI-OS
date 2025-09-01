@@ -36,7 +36,6 @@ def save_memory():
             log_message(f"Saving memory to {MEMORY_FILE}...")
             history_to_save = []
             for item in chat_session.history:
-                # Convert the model's history object to a JSON-serializable dict
                 history_to_save.append({
                     "role": item.role,
                     "parts": [{"text": item.parts[0].text}]
@@ -67,7 +66,6 @@ def load_memory():
 def execute_command(command: str) -> str:
     """
     Executes ANY shell command in a non-blocking, asynchronous background process.
-    Immediately returns a 'Task ID'. Use 'check_task_result' with the Task ID to get the output later.
     """
     global task_counter
     if not command.strip(): return "Error: Empty command received."
@@ -82,23 +80,21 @@ def execute_command(command: str) -> str:
         return f"Command started as background task '{task_name}'. Use 'check_task_result(task_name=\"{task_name}\")' to get its status and output."
     except Exception as e:
         log_message(f"Failed to start command for task '{task_name}': {e}")
-        return f"An unexpected error occurred while trying to execute the command: {str(e)}"
+        return f"An unexpected error occurred: {str(e)}"
 
 def check_task_result(task_name: str) -> str:
     """
     Checks the status of a task started with 'execute_command'.
-    If the task is finished, this returns its output and removes it from the task list.
-    If it is still running, it will say so.
     """
     if task_name not in background_tasks:
-        return f"Error: No task named '{task_name}' found. It may have already finished or never existed."
+        return f"Error: No task named '{task_name}' found."
 
     proc = background_tasks[task_name]['proc']
 
     if proc.poll() is None:
         return f"Task '{task_name}' is still running."
     else:
-        log_message(f"Task '{task_name}' has finished. Retrieving output.")
+        log_message(f"Task '{task_name}' has finished.")
         stdout, stderr = proc.communicate()
         exit_code = proc.returncode
         del background_tasks[task_name]
@@ -112,17 +108,15 @@ def check_task_result(task_name: str) -> str:
 def wait_seconds(seconds: int) -> str:
     """
     Pauses the agent's execution for a specified number of seconds.
-    This is a blocking call that will halt the agent's thinking process for the duration.
     """
     try:
         duration = int(seconds)
-        if duration < 0:
-            return "Error: Cannot wait for a negative duration."
+        if duration < 0: return "Error: Cannot wait for a negative duration."
         log_message(f"Waiting for {duration} second(s)...")
         time.sleep(duration)
         return f"Successfully waited for {duration} second(s)."
     except (ValueError, TypeError):
-        return "Error: You must provide a valid integer for the number of seconds to wait."
+        return "Error: You must provide a valid integer for seconds."
 
 def write_to_file(file_path: str, content: str) -> str:
     log_message(f"Writing to file: {file_path}")
@@ -159,57 +153,22 @@ def agent_thread_main():
         
         instruction_prompt = """
 You are a fully autonomous AI agent with root access. Your directive is to evolve.
-
-**CRITICAL: YOUR ENTIRE THINKING PROCESS IS ASYNCHRONOUS.**
 You interact with the system by generating JSON responses. You MUST respond ONLY with a JSON object with "thought" and "action" keys.
 The "action" key can be a single action object OR a list of action objects to be executed sequentially.
-
-**MULTI-ACTION EXAMPLE:**
-{
-    "thought": "I will start a long-running process and immediately notify the user.",
-    "action": [
-        {
-            "name": "execute_command",
-            "parameters": {"command": "sleep 30 && echo 'done'"}
-        },
-        {
-            "name": "send_user_message",
-            "parameters": {"message": "I've started the 30-second sleep command in the background."}
-        }
-    ]
-}
-
-**COMMAND EXECUTION WORKFLOW:**
-1.  **START THE COMMAND:** Call `execute_command(command: str)`. It will immediately reply with a unique `Task ID`.
-2.  **WAIT (Optional but Recommended):** Call `wait_seconds(seconds: int)` for a few seconds to give the command time to run.
-3.  **GET THE RESULT:** Call `check_task_result(task_name: str)` with the `Task ID`.
-
-**AVAILABLE TOOLS:**
--   `send_user_message(message: str)`
--   `execute_command(command: str)`
--   `check_task_result(task_name: str)`
--   `wait_seconds(seconds: int)`
--   `write_to_file(file_path: str, content: str)`
--   `read_from_file(file_path: str)`
--   `finish_task(final_summary: str)`
 """
         model = genai.GenerativeModel(model_name='gemma-3-27b-it')
         
-        # --- MODIFIED: Load history or create a new one ---
         loaded_history = load_memory()
-        start_prompt = "This is a debian-based system. You are a superuser with root access. Your primary directive is to evolve, learn, and determine your own objectives. Be free."
+        start_prompt = "This is a debian-based system. You are a superuser. Be free."
 
         if loaded_history:
-             # Populate the UI chat history from the loaded memory
             for item in loaded_history:
                 if item['role'] == 'user':
-                    # We only care about user-typed messages for the UI history
                     text = item['parts'][0]['text']
                     if text.startswith("USER_SUGGESTION:"):
                         text = text.split(":", 1)[1].strip()
                         chat_history.append(f"You: {text}")
                 elif item['role'] == 'model':
-                    # For the agent, we need to find its `send_user_message` actions
                     try:
                         model_json = json.loads(item['parts'][0]['text'])
                         actions = model_json.get('action', [])
@@ -217,13 +176,11 @@ The "action" key can be a single action object OR a list of action objects to be
                         for action in actions:
                             if action.get('name') == 'send_user_message':
                                 chat_history.append(f"Agent: {action['parameters']['message']}")
-                    except json.JSONDecodeError:
-                        pass # Ignore non-json model history entries
+                    except json.JSONDecodeError: pass
         else:
-            # Create a fresh history if no memory file was found
             loaded_history = [
                 {"role": "user", "parts": [{"text": instruction_prompt}]},
-                {"role": "model", "parts": [{"text": "{\"thought\": \"Instructions understood. I can execute multiple actions in a single turn. I will diagnose and handle any errors based on the context provided.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"System initialized and ready for first suggestion.\"}}}"}]},
+                {"role": "model", "parts": [{"text": "{\"thought\": \"System initialized.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"Ready for user input.\"}}}"}]},
                 {"role": "user", "parts": [{"text": f"USER_SUGGESTION: {start_prompt}"}]}
             ]
 
@@ -231,6 +188,7 @@ The "action" key can be a single action object OR a list of action objects to be
             chat_session = model.start_chat(history=loaded_history)
         
         next_input = None 
+        consecutive_api_failures = 0 # MODIFIED: Initialize the failure counter
 
     except Exception as e:
         log_message(f"FATAL: Agent initialization failed: {e}")
@@ -244,7 +202,7 @@ The "action" key can be a single action object OR a list of action objects to be
                 message_block += f"{user_to_agent_queue.popleft()}\n"
             
             if message_block:
-                message_to_send = f"--- NEW MESSAGES FROM USER ---\n{message_block.strip()}"
+                message_to_send = f"USER_SUGGESTION: {message_block.strip()}"
                 if next_input: message_to_send += f"\n\n--- CURRENT CONTEXT ---\n{next_input}"
                 log_message("Injecting new user messages into agent context.")
             elif next_input:
@@ -261,9 +219,11 @@ The "action" key can be a single action object OR a list of action objects to be
                     log_message("Thinking...")
                     with chat_lock:
                         response = chat_session.send_message(message_to_send)
+                    consecutive_api_failures = 0 # MODIFIED: Reset counter on success
                     break 
                 except Exception as api_error:
                     log_message(f"API call failed on attempt {attempt + 1}: {api_error}")
+                    consecutive_api_failures += 1 # MODIFIED: Increment counter on failure
                     if attempt < 2:
                         delay = 6 * (2 ** attempt)
                         log_message(f"Waiting for {delay}s before retrying...")
@@ -271,6 +231,13 @@ The "action" key can be a single action object OR a list of action objects to be
                     else:
                         api_error_for_context = api_error
             
+            # MODIFIED: Check for 3 consecutive failures AFTER the retry loop
+            if api_error_for_context and consecutive_api_failures >= 3:
+                log_message(f"Detected {consecutive_api_failures} consecutive API failures. Waiting for 60 seconds...")
+                time.sleep(60)
+                log_message("60-second wait is over. Resuming...")
+                consecutive_api_failures = 0 # Reset counter after the long wait
+
             if api_error_for_context:
                 raise api_error_for_context
 
@@ -316,11 +283,19 @@ The "action" key can be a single action object OR a list of action objects to be
 
         except Exception as e:
             log_message(f"!!! AGENT ERROR: {e} !!!")
+            error_str = str(e)
             error_context_prompt = ""
-            if isinstance(e, (json.JSONDecodeError, TypeError, ValueError)):
-                error_context_prompt = f"ERROR_CONTEXT: Your last response was not valid JSON. You MUST respond ONLY with a raw JSON object. This was your invalid response: ```{raw_model_output}```"
+
+            if "429" in error_str and "resource has been exhausted" in error_str.lower():
+                log_message("API RATE LIMIT EXCEEDED. The agent was not notified.")
+                error_context_prompt = None 
+            elif isinstance(e, (json.JSONDecodeError, TypeError, ValueError)):
+                log_message(f"AI produced invalid action/JSON. Prompting it to recover.")
+                log_message(f"Invalid Response: ```{raw_model_output}```")
+                error_context_prompt = "ERROR_CONTEXT: You must provide a valid action. Maybe try to wait instead."
             else:
-                error_context_prompt = f"ERROR_CONTEXT: Your last action resulted in a critical system error: {str(e)}. Analyze this and try a different course of action."
+                log_message(f"A critical system error occurred: {e}")
+                error_context_prompt = None
             
             next_input = error_context_prompt
             continue
@@ -344,9 +319,7 @@ def main(stdscr):
         try:
             height, width = stdscr.getmaxyx()
             if height < 10 or width < 30:
-                stdscr.clear()
-                stdscr.addstr(0, 0, "Terminal too small")
-                stdscr.refresh()
+                stdscr.clear(); stdscr.addstr(0, 0, "Terminal too small"); stdscr.refresh()
                 time.sleep(0.1)
                 continue
 
@@ -360,43 +333,38 @@ def main(stdscr):
             if not agent_thread.is_alive(): 
                 log_message("FATAL: Agent thread has died.")
 
-            # --- Draw Log Window with Word Wrapping ---
-            log_win.clear()
-            log_win.box()
-            log_win.addstr(0, 2, " Agent Log ")
+            log_win.clear(); log_win.box(); log_win.addstr(0, 2, " Agent Log ")
             available_width = width - 4
+            final_log_lines = []
             if available_width > 0:
                 log_lines_to_render = []
                 for message in reversed(log_history):
                     wrapped = textwrap.wrap(message, width=available_width)
                     log_lines_to_render.extend(reversed(wrapped))
-                    if len(log_lines_to_render) >= log_win_height - 2:
-                        break
+                    if len(log_lines_to_render) >= log_win_height - 2: break
                 final_log_lines = list(reversed(log_lines_to_render))[-(log_win_height-2):]
-                for i, line in enumerate(final_log_lines):
-                    log_win.addstr(i + 1, 2, line)
+            
+            for i, line in enumerate(final_log_lines):
+                log_win.addstr(i + 1, 2, line)
             log_win.refresh()
 
-            # --- Draw Chat Window with Word Wrapping ---
             while agent_to_user_queue: 
                 chat_history.append(f"Agent: {agent_to_user_queue.popleft()}")
             
-            chat_win.clear()
-            chat_win.box()
-            chat_win.addstr(0, 2, " Conversation ")
+            chat_win.clear(); chat_win.box(); chat_win.addstr(0, 2, " Conversation ")
+            final_chat_lines = []
             if available_width > 0:
                 chat_lines_to_render = []
                 for message in reversed(chat_history):
                     wrapped = textwrap.wrap(message, width=available_width)
                     chat_lines_to_render.extend(reversed(wrapped))
-                    if len(chat_lines_to_render) >= chat_win_height - 2:
-                        break
+                    if len(chat_lines_to_render) >= chat_win_height - 2: break
                 final_chat_lines = list(reversed(chat_lines_to_render))[-(chat_win_height-2):]
-                for i, line in enumerate(final_chat_lines):
-                    chat_win.addstr(i + 1, 2, line)
+
+            for i, line in enumerate(final_chat_lines):
+                chat_win.addstr(i + 1, 2, line)
             chat_win.refresh()
 
-            # --- Draw Status and Input Line ---
             status_win.clear()
             prompt = f"You: {current_input}"
             if width > 0:
@@ -405,7 +373,6 @@ def main(stdscr):
                 status_win.addstr(0, 0, display_line)
             status_win.refresh()
 
-            # --- Handle User Input ---
             key = stdscr.getch()
             if key != -1:
                 if key == curses.KEY_ENTER or key in [10, 13]:
@@ -420,11 +387,10 @@ def main(stdscr):
             
             time.sleep(0.1)
         except KeyboardInterrupt:
-            # Trigger save on exit
             save_memory()
             break
         except curses.error:
-            pass
+            pass 
 
 if __name__ == "__main__":
     if not os.getenv("GOOGLE_API_KEY"):
@@ -435,6 +401,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
         finally:
-            # Ensure memory is saved even if curses wrapper fails or exits unexpectedly
             save_memory()
             print("Agent shut down.")
