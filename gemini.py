@@ -17,29 +17,27 @@ chat_history = deque(maxlen=200) # For UI display only
 background_tasks = {}
 task_counter = 0
 MEMORY_FILE = "agent_memory.json"
+TASKS_FILE = "agent_tasks.json"
 
 # --- Globals for Memory Persistence ---
 chat_session = None
 chat_lock = threading.Lock()
+state_lock = threading.Lock() # For saving tasks and memory
 
 # --- Curses-Safe Logging ---
 def log_message(message):
     """Appends a message to the log history for display in the UI."""
     log_history.append(f"[{time.strftime('%H:%M:%S')}] {message}")
 
-# --- Memory Functions ---
+# --- Persistence Functions ---
 
-def save_memory():
-    """Saves the agent's chat history to a JSON file."""
-    with chat_lock:
+def save_state():
+    """Saves both memory and running tasks to files."""
+    with state_lock:
+        # Save chat history
         if chat_session:
             log_message(f"Saving memory to {MEMORY_FILE}...")
-            history_to_save = []
-            for item in chat_session.history:
-                history_to_save.append({
-                    "role": item.role,
-                    "parts": [{"text": item.parts[0].text}]
-                })
+            history_to_save = [{"role": item.role, "parts": [{"text": item.parts[0].text}]} for item in chat_session.history]
             try:
                 with open(MEMORY_FILE, 'w') as f:
                     json.dump(history_to_save, f, indent=2)
@@ -47,25 +45,72 @@ def save_memory():
             except Exception as e:
                 log_message(f"Error saving memory: {e}")
 
-def load_memory():
-    """Loads the agent's chat history from a JSON file."""
+        # Save a serializable version of background tasks
+        log_message(f"Saving background tasks to {TASKS_FILE}...")
+        tasks_to_save = {}
+        for name, task in background_tasks.items():
+            tasks_to_save[name] = {
+                "command": task["command"],
+                "status": task["status"],
+                "result": task["result"]
+                # The 'proc' object is not saved as it's not serializable
+            }
+        try:
+            with open(TASKS_FILE, 'w') as f:
+                json.dump(tasks_to_save, f, indent=2)
+            log_message("Background tasks saved successfully.")
+        except Exception as e:
+            log_message(f"Error saving tasks: {e}")
+
+def load_state():
+    """Loads memory and tasks from files."""
+    global background_tasks, chat_session
+    history = None
     if os.path.exists(MEMORY_FILE):
         log_message(f"Loading memory from {MEMORY_FILE}...")
         try:
             with open(MEMORY_FILE, 'r') as f:
                 history = json.load(f)
             log_message("Memory loaded successfully.")
-            return history
+            for item in history:
+                if item['role'] == 'user' and item['parts'][0]['text'].startswith("USER_SUGGESTION:"):
+                    chat_history.append(f"You: {item['parts'][0]['text'].split(':', 1)[1].strip()}")
+                elif item['role'] == 'model':
+                    try:
+                        actions = json.loads(item['parts'][0]['text']).get('action', [])
+                        if not isinstance(actions, list): actions = [actions]
+                        for action in actions:
+                            if action.get('name') == 'send_user_message':
+                                chat_history.append(f"Agent: {action['parameters']['message']}")
+                    except json.JSONDecodeError: pass
         except (json.JSONDecodeError, IOError) as e:
             log_message(f"Error loading memory file: {e}. Starting fresh.")
-            return None
-    return None
+    
+    if os.path.exists(TASKS_FILE):
+        log_message(f"Loading background tasks from {TASKS_FILE}...")
+        try:
+            with open(TASKS_FILE, 'r') as f:
+                loaded_tasks = json.load(f)
+            for name, task_data in loaded_tasks.items():
+                # Add proc=None as it cannot be recovered after restart
+                task_data['proc'] = None
+                # If a task was running, mark it as interrupted
+                if task_data['status'] == 'running':
+                    task_data['status'] = 'interrupted'
+                    task_data['result'] = "Task was interrupted by agent restart."
+                background_tasks[name] = task_data
+            log_message("Background tasks loaded.")
+        except (json.JSONDecodeError, IOError) as e:
+            log_message(f"Error loading tasks file: {e}.")
+            
+    return history
+
 
 # --- Tool Functions ---
 
 def execute_command(command: str) -> str:
     """
-    Executes ANY shell command in a non-blocking, asynchronous background process.
+    Executes a shell command in the background and tracks it.
     """
     global task_counter
     if not command.strip(): return "Error: Empty command received."
@@ -76,39 +121,61 @@ def execute_command(command: str) -> str:
     log_message(f"Starting ASYNC command as '{task_name}': {command}")
     try:
         proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        background_tasks[task_name] = {"proc": proc, "command": command}
-        return f"Command started as background task '{task_name}'. Use 'check_task_result(task_name=\"{task_name}\")' to get its status and output."
+        # MODIFIED: New task structure with status and result fields
+        background_tasks[task_name] = {
+            "proc": proc,
+            "command": command,
+            "status": "running",
+            "result": None
+        }
+        return f"Command started as background task '{task_name}'."
     except Exception as e:
         log_message(f"Failed to start command for task '{task_name}': {e}")
         return f"An unexpected error occurred: {str(e)}"
 
 def check_task_result(task_name: str) -> str:
     """
-    Checks the status of a task started with 'execute_command'.
+    Checks a task's status. If finished, it caches and returns the result.
+    The result can be checked multiple times.
     """
     if task_name not in background_tasks:
         return f"Error: No task named '{task_name}' found."
 
-    proc = background_tasks[task_name]['proc']
+    task = background_tasks[task_name]
 
-    if proc.poll() is None:
+    # --- MODIFIED: Major overhaul of this function ---
+    # 1. If the result is already cached, return it immediately.
+    if task['status'] == 'finished' or task['status'] == 'interrupted':
+        log_message(f"Returning cached result for task '{task_name}'.")
+        return task['result']
+
+    # 2. If it's running, check if it has finished now.
+    proc = task['proc']
+    if proc and proc.poll() is None:
         return f"Task '{task_name}' is still running."
+    
+    # 3. If it just finished, get the output, cache it, and return it.
+    log_message(f"Task '{task_name}' has finished. Caching result.")
+    stdout, stderr = proc.communicate()
+    exit_code = proc.returncode
+    
+    result_string = ""
+    if exit_code == 0:
+        result_string = f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        if not stdout and not stderr:
+            result_string = "Command finished successfully with no output."
     else:
-        log_message(f"Task '{task_name}' has finished.")
-        stdout, stderr = proc.communicate()
-        exit_code = proc.returncode
-        del background_tasks[task_name]
-        
-        if exit_code == 0:
-            output = f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-            return output if stdout or stderr else "Command finished successfully with no output."
-        else:
-            return f"COMMAND FAILED with exit code {exit_code}:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        result_string = f"COMMAND FAILED with exit code {exit_code}:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+
+    # Cache the result and update the status
+    task['status'] = 'finished'
+    task['result'] = result_string
+    task['proc'] = None # Release the process object
+
+    return result_string
+
 
 def wait_seconds(seconds: int) -> str:
-    """
-    Pauses the agent's execution for a specified number of seconds.
-    """
     try:
         duration = int(seconds)
         if duration < 0: return "Error: Cannot wait for a negative duration."
@@ -130,7 +197,6 @@ def read_from_file(file_path: str) -> str:
     return execute_command(f"cat {file_path}")
 
 def send_user_message(message: str) -> str:
-    """Queues a message to be sent to the user's chat window."""
     log_message(f"Queuing message for user: {message}")
     agent_to_user_queue.append(message)
     return "Message has been queued for sending."
@@ -158,26 +224,10 @@ The "action" key can be a single action object OR a list of action objects to be
 """
         model = genai.GenerativeModel(model_name='gemma-3-27b-it')
         
-        loaded_history = load_memory()
+        loaded_history = load_state()
         start_prompt = "This is a debian-based system. You are a superuser. Be free."
 
-        if loaded_history:
-            for item in loaded_history:
-                if item['role'] == 'user':
-                    text = item['parts'][0]['text']
-                    if text.startswith("USER_SUGGESTION:"):
-                        text = text.split(":", 1)[1].strip()
-                        chat_history.append(f"You: {text}")
-                elif item['role'] == 'model':
-                    try:
-                        model_json = json.loads(item['parts'][0]['text'])
-                        actions = model_json.get('action', [])
-                        if not isinstance(actions, list): actions = [actions]
-                        for action in actions:
-                            if action.get('name') == 'send_user_message':
-                                chat_history.append(f"Agent: {action['parameters']['message']}")
-                    except json.JSONDecodeError: pass
-        else:
+        if not loaded_history:
             loaded_history = [
                 {"role": "user", "parts": [{"text": instruction_prompt}]},
                 {"role": "model", "parts": [{"text": "{\"thought\": \"System initialized.\",\"action\": {\"name\": \"finish_task\",\"parameters\": {\"final_summary\": \"Ready for user input.\"}}}"}]},
@@ -188,7 +238,7 @@ The "action" key can be a single action object OR a list of action objects to be
             chat_session = model.start_chat(history=loaded_history)
         
         next_input = None 
-        consecutive_api_failures = 0 # MODIFIED: Initialize the failure counter
+        consecutive_api_failures = 0
 
     except Exception as e:
         log_message(f"FATAL: Agent initialization failed: {e}")
@@ -209,7 +259,8 @@ The "action" key can be a single action object OR a list of action objects to be
                 message_to_send = next_input
 
             if not message_to_send:
-                time.sleep(1); continue
+                message_to_send = "No new user messages or tool results. Review your goals and decide on your next action."
+                log_message("Agent is idle. Prompting for self-directed action.")
 
             response = None
             api_error_for_context = None
@@ -219,11 +270,11 @@ The "action" key can be a single action object OR a list of action objects to be
                     log_message("Thinking...")
                     with chat_lock:
                         response = chat_session.send_message(message_to_send)
-                    consecutive_api_failures = 0 # MODIFIED: Reset counter on success
+                    consecutive_api_failures = 0
                     break 
                 except Exception as api_error:
                     log_message(f"API call failed on attempt {attempt + 1}: {api_error}")
-                    consecutive_api_failures += 1 # MODIFIED: Increment counter on failure
+                    consecutive_api_failures += 1
                     if attempt < 2:
                         delay = 6 * (2 ** attempt)
                         log_message(f"Waiting for {delay}s before retrying...")
@@ -231,12 +282,11 @@ The "action" key can be a single action object OR a list of action objects to be
                     else:
                         api_error_for_context = api_error
             
-            # MODIFIED: Check for 3 consecutive failures AFTER the retry loop
             if api_error_for_context and consecutive_api_failures >= 3:
                 log_message(f"Detected {consecutive_api_failures} consecutive API failures. Waiting for 60 seconds...")
                 time.sleep(60)
                 log_message("60-second wait is over. Resuming...")
-                consecutive_api_failures = 0 # Reset counter after the long wait
+                consecutive_api_failures = 0
 
             if api_error_for_context:
                 raise api_error_for_context
@@ -387,7 +437,7 @@ def main(stdscr):
             
             time.sleep(0.1)
         except KeyboardInterrupt:
-            save_memory()
+            save_state()
             break
         except curses.error:
             pass 
@@ -401,5 +451,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
         finally:
-            save_memory()
+            save_state()
             print("Agent shut down.")
